@@ -1,7 +1,6 @@
 kurigram
 tgcrypto==1.2.5
-py-tgcalls==2.3.3
-yt-dlp
+py-tgcalls==0.9.7
 youtube_search
 aiohttp
 motor
