@@ -1,0 +1,10 @@
+kurigram
+tgcrypto==1.2.5
+py-tgcalls==0.9.7
+yt-dlp
+youtube_search
+aiohttp
+motor
+fastapi
+uvicorn
+Pillow
