@@ -10,7 +10,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InputMediaPhoto,
 )
-from pytgcalls.types import MediaStream
+from pytgcalls.types.input_stream import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall
 
 import config
@@ -497,7 +497,7 @@ async def _start_playing(chat_id: int, track: dict, message: Message):
     """VC join/change karke track play karta hai aur Now Playing card bhejta hai."""
     try:
         try:
-            await call_py.play(chat_id, MediaStream(track["stream_url"]))
+            await call_py.join_group_call(chat_id, AudioPiped(track["stream_url"]))
         except NoActiveGroupCall:
             return await message.reply_text(
                 f"❌ **{smallcaps_title('voice chat active nahi hai')}!**\n\n"
