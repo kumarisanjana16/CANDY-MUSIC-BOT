@@ -505,5 +505,531 @@ async def _start_playing(chat_id: int, track: dict, message: Message):
                 "Group Settings → Voice Chat → Start Voice Chat\n\n"
                 f"{smallcaps_title('phir')} `/play` {smallcaps_title('dobara bhejo')}."
             )
+        except Exception as e:   
+            if _is_peer_error(e):
+                await _refresh_assistant_peers()
+            try:
+                await call_py.change_stream(chat_id, AudioPiped(track["stream_url"]))
+            except Exception as e2:
+                LOGGER.error(f"Play error: {e2}")
+                return await message.reply_text(
+                    f"❌ **{smallcaps_title('play nahi ho paya')}**\n\n"
+                    f"{smallcaps_title('voice chat active hai ya nahi ek baar check kar lo, phir dobara try karo')}."
+                )
+
+        q.set_now_playing(chat_id, track)
+        await _send_now_playing(chat_id, track, message)
+
+    except Exception as e:
+        LOGGER.error(f"_start_playing fatal error: {e}")
+        await message.reply_text(f"❌ {smallcaps_title('kuch gadbad ho gayi, dobara try karo')}.")
+
+
+def _now_playing_caption(track: dict) -> str:
+    # Screenshot wala fancy style + expandable quote (tap karke expand/scroll).
+    artists = [a.strip() for a in str(track.get("channel") or "").replace("-", ",").split(",") if a.strip()]
+    if not artists:
+        artists = [track.get("requested_by", "Unknown")]
+
+    body = (
+        f"» 『 {smallcaps_title(track['title'])} 』\n"
+        f"{bullet_lines(smallcaps_title(a) for a in artists)}\n\n"
+        f"⌾ {smallcaps_title('duration')} : {track['duration']}\n"
+        f"⌾ {smallcaps_title('by')} : {track.get('requested_by', 'Unknown')}\n\n"
+        f"{DIVIDER}"
+    )
+    return f"❖ {smallcaps_title('Now Playing')}..!! ✦\n\n" + expandable_quote(body)
+
+
+async def _send_now_playing(chat_id: int, track: dict, message: Message = None, edit_message: Message = None):
+    """
+    Now Playing card bhejta hai. Agar `edit_message` diya gaya hai (jaise skip
+    button se), to naya message bhejne/purana delete karne ke bajaye wahi
+    message in-place update ho jaata hai — isse card kabhi "gayab" nahi hota,
+    bas apne aap refresh ho jaata hai.
+    """
+    caption = _now_playing_caption(track)
+    card = await generate_now_playing_card(track.get("thumbnail"), track["title"], track["duration"])
+    markup = _controls_keyboard()
+    media = card or track.get("thumbnail")
+
+    sent = None
+
+    if edit_message is not None:
+        try:
+            if media:
+                sent = await edit_message.edit_media(InputMediaPhoto(media, caption=caption), reply_markup=markup)
+            else:
+                sent = await edit_message.edit_text(caption, reply_markup=markup, disable_web_page_preview=True)
         except Exception as e:
-   
+            LOGGER.warning(f"Now playing in-place edit fail, naya message bhej rahe hain: {e}")
+
+    if sent is None:
+        try:
+            if media:
+                sent = await _safe_quote_send(
+                    lambda t: bot.send_photo(chat_id, media, caption=t, reply_markup=markup), caption
+                )
+            elif message is not None:
+                sent = await _safe_quote_send(
+                    lambda t: message.reply_text(t, reply_markup=markup, disable_web_page_preview=True), caption
+                )
+            else:
+                sent = await _safe_quote_send(
+                    lambda t: bot.send_message(chat_id, t, reply_markup=markup, disable_web_page_preview=True),
+                    caption,
+                )
+        except Exception as e:
+            LOGGER.warning(f"Now playing card send fail: {e}")
+            plain = strip_quotes(caption)
+            if message is not None:
+                sent = await message.reply_text(plain, reply_markup=markup, disable_web_page_preview=True)
+            else:
+                sent = await bot.send_message(chat_id, plain, reply_markup=markup, disable_web_page_preview=True)
+
+
+    # 🎚️ Live progress bar shuru — gaana ke saath 00:00 se duration tak khud
+    # aage badhta rahega, jaise screenshot mein dikha tha.
+    if sent is not None:
+        total_sec = duration_to_seconds(track.get("duration"))
+        progress.start(chat_id, track["id"])
+        progress.start_updater(
+            chat_id, sent,
+            lambda: _now_playing_caption(track),
+            _controls_keyboard,
+            track["id"], total_sec,
+        )
+
+    return sent
+
+
+# ---------------------------------------------------------------------------
+# Autoplay — jab queue khatam ho jaaye aur chat mein autoplay ON ho, to bot
+# khud current gaane se related agla gaana dhoondh ke bajata rehta hai
+# (youtube ke autoplay jaisa). Toggle: Now Playing -> ⚙️ Bot Settings.
+# ---------------------------------------------------------------------------
+async def _autoplay_next_track(chat_id: int):
+    if not await db.get_autoplay(chat_id):
+        return None
+
+    current = q.get_now_playing(chat_id)
+    if not current:
+        return None
+
+    try:
+        track = await get_related_track(current.get("title", ""), exclude_id=current.get("id"))
+        if not track:
+            return None
+        track["stream_url"] = await get_stream_url(track["id"])
+
+    except Exception as e:
+        LOGGER.warning(f"Autoplay next track fail: {e}")
+        return None
+
+    track["requested_by"] = f"🔁 {smallcaps_title('autoplay')}"
+    track["requested_by_id"] = current.get("requested_by_id")
+    return track
+
+
+# ---------------------------------------------------------------------------
+# Stream khatam hone par queue se agla gaana
+# ---------------------------------------------------------------------------
+@call_py.on_stream_end()
+async def on_stream_end(client, update):
+    chat_id = update.chat_id
+    next_track = q.pop_next(chat_id)
+
+    if not next_track:
+        # Queue khaali — autoplay ON hai to related gaana khud bajao
+        next_track = await _autoplay_next_track(chat_id)
+
+    if not next_track:
+        q.set_now_playing(chat_id, None)
+        progress.clear(chat_id)
+        try:
+            await call_py.leave_group_call(chat_id)
+        except Exception as e:
+            LOGGER.warning(f"Auto leave fail: {e}")
+        return
+
+
+    try:
+        try:
+            await call_py.change_stream(chat_id, AudioPiped(next_track["stream_url"]))
+        except Exception as e:
+            if _is_peer_error(e):
+                await _refresh_assistant_peers()
+            await call_py.join_group_call(chat_id, AudioPiped(next_track["stream_url"]))
+
+        q.set_now_playing(chat_id, next_track)
+        await _send_now_playing(chat_id, next_track)
+    except Exception as e:
+        LOGGER.error(f"Auto-play next error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# /autoplayon /autoplayoff — group ka autoplay chalu/band (sirf admin/owner ya
+# jisne current gaana request kiya). Button wala toggle bhi yahi setting use
+# karta hai.
+# ---------------------------------------------------------------------------
+async def _set_autoplay_cmd(client, message: Message, value: bool):
+    if not await _can_control(client, message.chat.id, message.from_user.id):
+        return await message.reply_text(NOT_YOUR_REQUEST_TEXT)
+    await db.set_autoplay(message.chat.id, value)
+    state = smallcaps_title("on") if value else smallcaps_title("off")
+    await message.reply_text(f"🔁 {smallcaps_title('autoplay')} : {state}")
+
+
+@bot.on_message(filters.command(["autoplayon", "autuolayon"]) & filters.group)
+async def autoplay_on_command(client, message: Message):
+    await _set_autoplay_cmd(client, message, True)
+
+
+@bot.on_message(filters.command(["autoplayoff", "autuolayoff"]) & filters.group)
+async def autoplay_off_command(client, message: Message):
+    await _set_autoplay_cmd(client, message, False)
+
+
+# ---------------------------------------------------------------------------
+# /skip /pause /resume /stop — sirf group admin/owner
+# ---------------------------------------------------------------------------
+@bot.on_message(filters.command("skip") & filters.group)
+async def skip_command(client, message: Message):
+    if not await _can_control(client, message.chat.id, message.from_user.id):
+        return await message.reply_text(NOT_YOUR_REQUEST_TEXT)
+
+    chat_id = message.chat.id
+    next_track = q.pop_next(chat_id)
+    if not next_track:
+        q.set_now_playing(chat_id, None)
+        progress.clear(chat_id)
+        try:
+            await call_py.leave_group_call(chat_id)
+        except Exception:
+            pass
+        return await message.reply_text(f"⏭ {smallcaps_title('queue khaali hai, vc se nikal gaya')}.")
+
+    try:
+        await call_py.change_stream(chat_id, AudioPiped(next_track["stream_url"]))
+    except Exception as e:
+        if _is_peer_error(e):
+            await _refresh_assistant_peers()
+        try:
+            await call_py.join_group_call(chat_id, AudioPiped(next_track["stream_url"]))
+        except Exception as e2:
+            LOGGER.error(f"Skip error: {e2}")
+            return await message.reply_text(f"❌ {smallcaps_title('skip nahi ho paya, dobara try karo')}.")
+
+    q.set_now_playing(chat_id, next_track)
+    await _send_now_playing(chat_id, next_track, message)
+
+
+@bot.on_message(filters.command("pause") & filters.group)
+async def pause_command(client, message: Message):
+    if not await _can_control(client, message.chat.id, message.from_user.id):
+        return await message.reply_text(NOT_YOUR_REQUEST_TEXT)
+    try:
+        await call_py.pause_stream(message.chat.id)
+        q.set_state(message.chat.id, "paused")
+        progress.pause(message.chat.id)
+        await message.reply_text(f"⏸ {smallcaps_title('paused')}.")
+    except Exception as e:
+        await message.reply_text(f"❌ {e}")
+
+
+@bot.on_message(filters.command("resume") & filters.group)
+async def resume_command(client, message: Message):
+    if not await _can_control(client, message.chat.id, message.from_user.id):
+        return await message.reply_text(NOT_YOUR_REQUEST_TEXT)
+    try:
+        await call_py.resume_stream(message.chat.id)
+        q.set_state(message.chat.id, "playing")
+        progress.resume(message.chat.id)
+        await message.reply_text(f"▶️ {smallcaps_title('resumed')}.")
+    except Exception as e:
+        await message.reply_text(f"❌ {e}")
+
+
+@bot.on_message(filters.command(["stop", "end"]) & filters.group)
+async def stop_command(client, message: Message):
+    if not await _can_control(client, message.chat.id, message.from_user.id):
+        return await message.reply_text(NOT_YOUR_REQUEST_TEXT)
+    try:
+        await call_py.leave_group_call(message.chat.id)
+    except Exception:
+        pass
+    q.clear(message.chat.id)
+    progress.clear(message.chat.id)
+    await message.reply_text(f"⏹️ {smallcaps_title('voice chat band kar diya')}.")
+
+
+# ---------------------------------------------------------------------------
+# /reload — sirf group admin/owner. Check karta hai bot khud admin hai ya nahi.
+# ---------------------------------------------------------------------------
+@bot.on_message(filters.command("reload") & filters.group)
+async def reload_command(client, message: Message):
+    if not await _is_group_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text(ADMIN_ONLY_TEXT)
+
+    me = await bot.get_me()
+    try:
+        bot_member = await client.get_chat_member(message.chat.id, me.id)
+        is_bot_admin = bot_member.status in ADMIN_STATUSES
+    except Exception as e:
+        LOGGER.warning(f"Reload admin-check fail: {e}")
+        is_bot_admin = False
+
+    if is_bot_admin:
+        await message.reply_text(f"✅ {smallcaps_title('reloaded successfully')}.")
+    else:
+        await message.reply_text(
+            f"❌ {smallcaps_title('mujhe pehle group admin banao, phir')} `/reload` {smallcaps_title('karo')}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# ⏪ -10s / ⏩ +10s — stream ko ffmpeg ke `-ss` ke saath dobara us position se
+# shuru kar deta hai, aur progress bar bhi wahin set ho jaata hai.
+# ---------------------------------------------------------------------------
+async def _seek_stream(chat_id: int, delta: int) -> "int | None":
+    track = q.get_now_playing(chat_id)
+    if not track:
+        return None
+
+    total = duration_to_seconds(track.get("duration"))
+    position = int(progress.elapsed(chat_id)) + delta
+    position = max(0, position)
+    if total and position >= total - 1:
+        position = max(0, total - 2)
+
+    try:
+        stream = AudioPiped(track["stream_url"], additional_ffmpeg_parameters=f"-ss {position}")
+    except TypeError:
+        # bahut purani py-tgcalls build jo extra ffmpeg params support nahi karti
+        LOGGER.warning("AudioPiped additional_ffmpeg_parameters support nahi hai — seek skip")
+        return None
+
+    try:
+        await call_py.change_stream(chat_id, stream)
+    except Exception as e:
+        if _is_peer_error(e):
+            await _refresh_assistant_peers()
+            await call_py.change_stream(chat_id, stream)
+        else:
+            raise
+
+    progress.seek(chat_id, position)
+    if q.get_state(chat_id) == "paused":
+        q.set_state(chat_id, "playing")
+    return position
+
+
+# ---------------------------------------------------------------------------
+# Inline buttons (Now Playing card ke neeche)
+# ---------------------------------------------------------------------------
+
+@bot.on_callback_query(filters.regex("^m_"))
+async def controls_callback(client, cq: CallbackQuery):
+    chat_id = cq.message.chat.id
+    action = cq.data
+
+    # Skip/pause/resume/stop/seek/settings buttons — commands jaisa hi permission
+    # check: sirf jisne current track request kiya tha, ya group admin/owner.
+    if action in ("m_resume", "m_pause", "m_skip", "m_stop", "m_back10", "m_fwd10", "m_autoplay"):
+        if not await _can_control(client, chat_id, cq.from_user.id):
+            return await cq.answer(NOT_YOUR_REQUEST_TEXT, show_alert=True)
+
+
+    try:
+        if action == "m_resume":
+            await call_py.resume_stream(chat_id)
+            q.set_state(chat_id, "playing")
+            progress.resume(chat_id)
+            await cq.answer("▶️ Resumed")
+
+        elif action == "m_pause":
+            await call_py.pause_stream(chat_id)
+            q.set_state(chat_id, "paused")
+            progress.pause(chat_id)
+            await cq.answer("⏸ Paused")
+
+        elif action == "m_replay":
+            track = q.get_now_playing(chat_id)
+            if track:
+                await call_py.change_stream(chat_id, AudioPiped(track["stream_url"]))
+                progress.replay(chat_id)
+                await cq.answer("🔁 Replaying")
+            else:
+                await cq.answer(smallcaps_title("kuch bhi nahi baj raha"), show_alert=True)
+
+        elif action == "m_skip":
+            await cq.answer("⏭ Skipping")
+            next_track = q.pop_next(chat_id)
+            if not next_track:
+                q.set_now_playing(chat_id, None)
+                progress.clear(chat_id)
+                await call_py.leave_group_call(chat_id)
+                try:
+                    await cq.message.edit_reply_markup(None)
+                except Exception:
+                    pass
+                await cq.message.reply_text(f"⏭ {smallcaps_title('queue khaali hai, vc se nikal gaya')}.")
+            else:
+                await call_py.change_stream(chat_id, AudioPiped(next_track["stream_url"]))
+                q.set_now_playing(chat_id, next_track)
+                # Naya message bhejne ke bajaye wahi card in-place update ho jaata hai
+                # (_send_now_playing khud naye track ka progress bar shuru kar deta hai)
+                await _send_now_playing(chat_id, next_track, edit_message=cq.message)
+
+        elif action == "m_stop":
+            await call_py.leave_group_call(chat_id)
+            q.clear(chat_id)
+            progress.clear(chat_id)
+            await cq.answer("⏹ Stopped")
+            try:
+                await cq.message.edit_reply_markup(None)
+            except Exception:
+                pass
+            await cq.message.reply_text(f"⏹️ {smallcaps_title('voice chat band kar diya')}.")
+
+        elif action in ("m_back10", "m_fwd10"):
+            delta = SEEK_STEP if action == "m_fwd10" else -SEEK_STEP
+            position = await _seek_stream(chat_id, delta)
+            if position is None:
+                await cq.answer(smallcaps_title("kuch bhi nahi baj raha"), show_alert=True)
+            else:
+                arrow = "⏩" if delta > 0 else "⏪"
+                await cq.answer(f"{arrow} {format_duration(position)}")
+
+        elif action == "m_settings":
+            await cq.answer()
+            autoplay_on = await db.get_autoplay(chat_id)
+            await cq.message.edit_reply_markup(_settings_keyboard(autoplay_on))
+
+        elif action == "m_autoplay":
+            new_value = not await db.get_autoplay(chat_id)
+            await db.set_autoplay(chat_id, new_value)
+            state = smallcaps_title("on") if new_value else smallcaps_title("off")
+            await cq.answer(f"🔁 {smallcaps_title('autoplay')} : {state}")
+            await cq.message.edit_reply_markup(_settings_keyboard(new_value))
+
+        elif action == "m_back":
+            await cq.answer()
+            await cq.message.edit_reply_markup(_controls_keyboard())
+
+        elif action == "m_close":
+
+            await cq.answer()
+            progress.cancel_task(chat_id)
+            await cq.message.delete()
+
+    except Exception as e:
+        LOGGER.warning(f"Callback error ({action}): {e}")
+        await cq.answer(f"❌ {e}", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# Owner: /addvd /delvd — /start message ke saath jaane wala image/video/gif
+# ---------------------------------------------------------------------------
+@bot.on_message(filters.command("addvd") & OWNER_FILTER)
+async def addvd_command(client, message: Message):
+    _pending_addvd.add(message.from_user.id)
+    await message.reply_text(
+        f"🖼 {smallcaps_title('ab ek image, video ya gif bhejo — wahi ab se PRIVATE start message ke saath sabko jayega')}."
+    )
+
+
+@bot.on_message(filters.command("delvd") & OWNER_FILTER)
+async def delvd_command(client, message: Message):
+    await db.delete_start_media()
+    _pending_addvd.discard(message.from_user.id)
+    await message.reply_text(f"🗑 {smallcaps_title('private start message media hata diya gaya')}.")
+
+
+@bot.on_message(filters.command("addvd2") & OWNER_FILTER)
+async def addvd2_command(client, message: Message):
+    _pending_addvd2.add(message.from_user.id)
+    await message.reply_text(
+        f"🖼 {smallcaps_title('ab ek image, video ya gif bhejo — wahi ab se GROUP start message ke saath sabko jayega')}."
+    )
+
+
+@bot.on_message(filters.command("delvd2") & OWNER_FILTER)
+async def delvd2_command(client, message: Message):
+    await db.delete_group_start_media()
+    _pending_addvd2.discard(message.from_user.id)
+    await message.reply_text(f"🗑 {smallcaps_title('group start message media hata diya gaya')}.")
+
+
+@bot.on_message(
+    (filters.photo | filters.video | filters.animation)
+    & OWNER_FILTER
+    & filters.create(
+        lambda _, __, m: bool(m.from_user)
+        and (m.from_user.id in _pending_addvd or m.from_user.id in _pending_addvd2)
+    )
+)
+async def addvd_receive(client, message: Message):
+    is_group_variant = message.from_user.id in _pending_addvd2
+    _pending_addvd.discard(message.from_user.id)
+    _pending_addvd2.discard(message.from_user.id)
+
+    if message.photo:
+        file_id, media_type = message.photo.file_id, "photo"
+    elif message.video:
+        file_id, media_type = message.video.file_id, "video"
+    elif message.animation:
+        file_id, media_type = message.animation.file_id, "animation"
+    else:
+        return
+
+    if is_group_variant:
+        await db.set_group_start_media(file_id, media_type)
+        await message.reply_text(f"✅ {smallcaps_title('group start message media set ho gaya')}.")
+    else:
+        await db.set_start_media(file_id, media_type)
+        await message.reply_text(f"✅ {smallcaps_title('private start message media set ho gaya')}.")
+
+
+# # ---------------------------------------------------------------------------
+# Owner: /broadcast
+# ---------------------------------------------------------------------------
+@bot.on_message(filters.command("broadcast") & OWNER_FILTER)
+async def broadcast_command(client, message: Message):
+    if len(message.command) < 2 and not message.reply_to_message:
+        return await message.reply_text(
+            f"❌ {smallcaps_title('broadcast ke liye message do')}!\nExample: `/broadcast Hello everyone`"
+        )
+
+    text = message.text.split(None, 1)[1] if len(message.command) > 1 else None
+    users = await db.get_all_users()
+    status = await message.reply_text(f"📢 {smallcaps_title('broadcasting to')} {len(users)} {smallcaps_title('users')}...")
+
+    sent, failed = 0, 0
+    for uid in users:
+        try:
+            if message.reply_to_message:
+                await message.reply_to_message.copy(uid)
+            else:
+                await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await status.edit_text(
+        f"✅ {smallcaps_title('broadcast done')}.\n{smallcaps_title('sent')}: {sent}\n{smallcaps_title('failed')}: {failed}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /id — user aur chat id batao
+# ---------------------------------------------------------------------------
+@bot.on_message(filters.command("id"))
+async def id_command(client, message: Message):
+    user_id = message.from_user.id if message.from_user else "Unknown"
+    lines = [f"👤 **{smallcaps_title('your id')}:** `{user_id}`"]
+    if message.chat.type != "private":
+        lines.append(f"👥 **{smallcaps_title('chat id')}:** `{message.chat.id}`")
+    if message.reply_to_message and message.reply_to_message.from_user:
+        lines.append(f"↩️ **{smallcaps_title('replied user id')}:** `{message.reply_to_message.from_user.id}`")
+    await message.reply_text("\n".join(lines))
